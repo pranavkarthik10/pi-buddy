@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { getAgentDir } from "@mariozechner/pi-coding-agent";
+import { Text } from "@mariozechner/pi-tui";
 
 type Rarity = "common" | "uncommon" | "rare" | "epic" | "legendary";
 type Eye = "·" | "✦" | "×" | "◉" | "@" | "°";
@@ -55,6 +56,7 @@ type BuddyState = {
 
 const STATE_FILE = join(getAgentDir(), "buddy-state.json");
 const BUDDY_WIDGET_KEY = "buddy";
+const BUDDY_REVEAL_WIDGET_KEY = "buddy-reveal";
 const BUDDY_STATUS_KEY = "buddy";
 const TICK_MS = 500;
 const BUBBLE_SHOW_MS = 10_000;
@@ -210,6 +212,9 @@ let tick = 0;
 let ticker: ReturnType<typeof setInterval> | undefined;
 let reactionText: string | undefined;
 let reactionStartedAt = 0;
+let revealUntil = 0;
+let lastWidgetSignature: string | undefined;
+let lastRevealSignature: string | undefined;
 
 function mulberry32(seed: number): () => number {
   let a = seed >>> 0;
@@ -321,6 +326,16 @@ function spriteFrameCount(species: Species): number {
   return BODIES[species].length;
 }
 
+function rarityLabel(rarity: Rarity): string {
+  return {
+    common: "★",
+    uncommon: "★★",
+    rare: "★★★",
+    epic: "★★★★",
+    legendary: "★★★★★",
+  }[rarity];
+}
+
 function isBuddyTeaserWindow(): boolean {
   const d = new Date();
   return d.getFullYear() === 2026 && d.getMonth() === 3 && d.getDate() <= 7;
@@ -348,8 +363,30 @@ function padRight(text: string, width: number): string {
   return text.length >= width ? text.slice(0, width) : text + " ".repeat(width - text.length);
 }
 
-function joinColumns(left: string, right: string, totalWidth = 88, rightWidth = 18): string {
-  const gutter = "   ";
+function centerText(text: string, width: number): string {
+  if (text.length >= width) return text.slice(0, width);
+  const left = Math.floor((width - text.length) / 2);
+  const right = width - text.length - left;
+  return `${" ".repeat(left)}${text}${" ".repeat(right)}`;
+}
+
+function leadingSpaces(text: string): number {
+  const m = text.match(/^\s*/);
+  return m ? m[0].length : 0;
+}
+
+function centeredNameForSprite(name: string, sprite: string[], spriteWidth: number): string {
+  const nonEmpty = sprite.filter((line) => line.trim().length > 0);
+  if (nonEmpty.length === 0) return centerText(name, spriteWidth);
+  const leftInset = Math.min(...nonEmpty.map((line) => leadingSpaces(line)));
+  const rightEdge = Math.max(...nonEmpty.map((line) => line.trimEnd().length));
+  const visibleWidth = Math.max(1, rightEdge - leftInset);
+  const centeredVisible = centerText(name, visibleWidth).trimEnd();
+  const prefix = " ".repeat(leftInset);
+  return padRight(`${prefix}${centeredVisible}`, spriteWidth);
+}
+
+function joinColumns(left: string, right: string, totalWidth = 112, rightWidth = 18, gutter = " "): string {
   return `${padRight(left, totalWidth - gutter.length - rightWidth)}${gutter}${padRight(right, rightWidth)}`;
 }
 
@@ -379,6 +416,26 @@ function setReaction(text: string | undefined): void {
   reactionStartedAt = text ? Date.now() : 0;
 }
 
+function hatchCardLines(companion: Companion): string[] {
+  const stats = STAT_NAMES.map((stat) => {
+    const value = String(companion.stats[stat]).padStart(3);
+    return `${padRight(stat, 11)} ${value}`;
+  });
+  return [
+    "┌──────────────────────────────────────────────────────┐",
+    `│ ${padRight(`${rarityLabel(companion.rarity)} ${companion.rarity.toUpperCase()}`, 24)}${padRight(companion.species.toUpperCase(), 28)}│`,
+    "│                                                      │",
+    ...renderSprite(companion, 0).map((line) => `│ ${padRight(line, 52)}│`),
+    "│                                                      │",
+    `│ ${centerText(companion.name, 52)}│`,
+    "│                                                      │",
+    `│ ${padRight(companion.personality.slice(0, 52), 52)}│`,
+    "│                                                      │",
+    ...stats.map((line) => `│ ${padRight(line, 52)}│`),
+    "└──────────────────────────────────────────────────────┘",
+  ];
+}
+
 function widgetLines(state: BuddyState, companion: Companion): string[] {
   const reaction = currentReaction();
   const petting = !!state.lastPetAt && Date.now() - state.lastPetAt < PET_BURST_MS;
@@ -388,37 +445,73 @@ function widgetLines(state: BuddyState, companion: Companion): string[] {
   const frame = blink ? 0 : step % frameCount;
   const body = renderSprite(companion, frame).map((line) => blink ? line.replaceAll(companion.eye, "-") : line);
   const sprite = petting ? [HEARTS[Math.floor((Date.now() - state.lastPetAt!) / TICK_MS) % HEARTS.length]!, ...body] : body;
-  const left = reaction
-    ? ["/buddy", "", ...bubbleLines(reaction)]
-    : ["/buddy", "Hatch a coding companion · pet, off, reroll", ""];
-  const rows = Math.max(left.length, sprite.length + 1);
+  const spriteWidth = Math.max(18, ...sprite.map((line) => line.length));
+  const spriteWithName = [...sprite, centeredNameForSprite(companion.name, sprite, spriteWidth)];
+  const bubble = reaction ? bubbleLines(reaction) : [];
+  const rows = Math.max(bubble.length, spriteWithName.length);
   const lines: string[] = [];
   for (let i = 0; i < rows; i++) {
-    const leftText = left[i] ?? "";
-    const rightText = sprite[i] ?? (i === sprite.length ? companion.name : "");
-    lines.push(joinColumns(leftText, rightText));
+    const leftText = bubble[i] ?? "";
+    const rightText = spriteWithName[i] ?? "";
+    const rightWidth = spriteWidth;
+    const leftWidth = Math.max(...bubble.map((line) => line.length), 0);
+    const unitWidth = leftWidth + 1 + rightWidth;
+    const outerPad = Math.max(0, 112 - unitWidth);
+    lines.push(`${" ".repeat(outerPad)}${padRight(leftText, leftWidth)} ${padRight(rightText, rightWidth)}`);
   }
   return lines;
 }
 
 function teaserLines(): string[] {
-  return ["/buddy", "Hatch a coding companion · pet, off", "", "Type /buddy to hatch."];
+  return ["/buddy", "Type /buddy to hatch."];
+}
+
+function setRightAlignedWidget(key: string, lines: string[] | undefined, placement: "aboveEditor" | "belowEditor", cache: "main" | "reveal"): void {
+  if (!activeCtx?.hasUI) return;
+  const signature = lines ? lines.join("\n") : undefined;
+  if (cache === "main") {
+    if (signature === lastWidgetSignature) return;
+    lastWidgetSignature = signature;
+  } else {
+    if (signature === lastRevealSignature) return;
+    lastRevealSignature = signature;
+  }
+  if (!lines) {
+    activeCtx.ui.setWidget(key, undefined, { placement });
+    return;
+  }
+  activeCtx.ui.setWidget(
+    key,
+    () => ({
+      render(width: number) {
+        const maxLineWidth = Math.max(0, ...lines.map((line) => line.length));
+        const indent = Math.max(0, width - maxLineWidth);
+        return lines.map((line) => `${" ".repeat(indent)}${line}`);
+      },
+      invalidate() {},
+    }),
+    { placement },
+  );
 }
 
 function renderActiveWidget(): void {
   if (!activeCtx?.hasUI || !activeState) return;
   if (activeState.hidden) {
-    activeCtx.ui.setWidget(BUDDY_WIDGET_KEY, undefined);
+    setRightAlignedWidget(BUDDY_WIDGET_KEY, undefined, "belowEditor", "main");
+    setRightAlignedWidget(BUDDY_REVEAL_WIDGET_KEY, undefined, "aboveEditor", "reveal");
     activeCtx.ui.setStatus(BUDDY_STATUS_KEY, undefined);
     return;
   }
   const companion = getCompanion(activeState);
   if (!companion) {
-    activeCtx.ui.setWidget(BUDDY_WIDGET_KEY, isBuddyTeaserWindow() ? teaserLines() : undefined, { placement: "aboveEditor" });
+    setRightAlignedWidget(BUDDY_REVEAL_WIDGET_KEY, undefined, "aboveEditor", "reveal");
+    setRightAlignedWidget(BUDDY_WIDGET_KEY, isBuddyTeaserWindow() ? teaserLines() : undefined, "belowEditor", "main");
     activeCtx.ui.setStatus(BUDDY_STATUS_KEY, undefined);
     return;
   }
-  activeCtx.ui.setWidget(BUDDY_WIDGET_KEY, widgetLines(activeState, companion), { placement: "aboveEditor" });
+  const showingReveal = Date.now() < revealUntil;
+  setRightAlignedWidget(BUDDY_REVEAL_WIDGET_KEY, showingReveal ? hatchCardLines(companion) : undefined, "aboveEditor", "reveal");
+  setRightAlignedWidget(BUDDY_WIDGET_KEY, showingReveal ? undefined : widgetLines(activeState, companion), "belowEditor", "main");
   activeCtx.ui.setStatus(BUDDY_STATUS_KEY, undefined);
 }
 
@@ -426,7 +519,8 @@ function ensureTicker(): void {
   if (ticker) return;
   ticker = setInterval(() => {
     tick += 1;
-    renderActiveWidget();
+    const shouldAnimate = !!activeState?.companion && (Date.now() < revealUntil || !!currentReaction() || (!!activeState?.lastPetAt && Date.now() - activeState.lastPetAt < PET_BURST_MS) || !activeState.hidden);
+    if (shouldAnimate) renderActiveWidget();
   }, TICK_MS);
 }
 
@@ -450,7 +544,8 @@ async function hatchBuddy(ctx: ExtensionContext, state: BuddyState): Promise<Com
   state.muted = false;
   state.lastPetAt = undefined;
   saveState(state);
-  setReaction(`${name} hatched. try /buddy pet, /buddy off, or say its name.`);
+  revealUntil = Date.now() + 4500;
+  setReaction(undefined);
   renderActiveWidget();
   return getCompanion(state)!;
 }
@@ -471,6 +566,8 @@ export default function buddyExtension(pi: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => {
     activeCtx = ctx;
     activeState = state;
+    lastWidgetSignature = undefined;
+    lastRevealSignature = undefined;
     ensureTicker();
     renderActiveWidget();
     const companion = getCompanion(state);
@@ -537,6 +634,7 @@ export default function buddyExtension(pi: ExtensionAPI): void {
         state.muted = false;
         saveState(state);
         setReaction(`${companion.name} is back.`);
+        revealUntil = 0;
         renderActiveWidget();
         return;
       }
@@ -549,7 +647,8 @@ export default function buddyExtension(pi: ExtensionAPI): void {
         state.hidden = false;
         state.lastPetAt = Date.now();
         saveState(state);
-        setReaction("approved. continue.");
+        revealUntil = 0;
+        setReaction(`${companion.name} leans into the petting.`);
         renderActiveWidget();
         return;
       }
@@ -567,6 +666,7 @@ export default function buddyExtension(pi: ExtensionAPI): void {
         }
         state.companion = { ...state.companion!, name: remainder };
         saveState(state);
+        revealUntil = 0;
         setReaction(`${remainder} renamed.`);
         renderActiveWidget();
         return;
@@ -579,6 +679,7 @@ export default function buddyExtension(pi: ExtensionAPI): void {
         }
         state.companion = { ...state.companion!, personality: remainder };
         saveState(state);
+        revealUntil = 0;
         setReaction("new vibe installed.");
         renderActiveWidget();
         return;
@@ -590,6 +691,7 @@ export default function buddyExtension(pi: ExtensionAPI): void {
         state.muted = false;
         state.lastPetAt = undefined;
         saveState(state);
+        revealUntil = 0;
         setReaction(undefined);
         renderActiveWidget();
         ctx.ui.notify("Buddy reset. Run /buddy to hatch again.", "info");
@@ -603,6 +705,7 @@ export default function buddyExtension(pi: ExtensionAPI): void {
 
       state.hidden = false;
       saveState(state);
+      revealUntil = 0;
       renderActiveWidget();
     },
   });
