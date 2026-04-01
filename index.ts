@@ -208,13 +208,12 @@ const HAT_LINES: Record<Hat, string> = {
 
 let activeCtx: ExtensionContext | undefined;
 let activeState: BuddyState | undefined;
+let piRef: ExtensionAPI | undefined;
 let tick = 0;
 let ticker: ReturnType<typeof setInterval> | undefined;
 let reactionText: string | undefined;
 let reactionStartedAt = 0;
-let revealVisible = false;
 let lastWidgetSignature: string | undefined;
-let lastRevealSignature: string | undefined;
 
 function mulberry32(seed: number): () => number {
   let a = seed >>> 0;
@@ -466,16 +465,11 @@ function teaserLines(): string[] {
   return ["/buddy", "Type /buddy to hatch."];
 }
 
-function setRightAlignedWidget(key: string, lines: string[] | undefined, placement: "aboveEditor" | "belowEditor", cache: "main" | "reveal"): void {
+function setRightAlignedWidget(key: string, lines: string[] | undefined, placement: "aboveEditor" | "belowEditor"): void {
   if (!activeCtx?.hasUI) return;
   const signature = lines ? lines.join("\n") : undefined;
-  if (cache === "main") {
-    if (signature === lastWidgetSignature) return;
-    lastWidgetSignature = signature;
-  } else {
-    if (signature === lastRevealSignature) return;
-    lastRevealSignature = signature;
-  }
+  if (signature === lastWidgetSignature) return;
+  lastWidgetSignature = signature;
   if (!lines) {
     activeCtx.ui.setWidget(key, undefined, { placement });
     return;
@@ -494,37 +488,23 @@ function setRightAlignedWidget(key: string, lines: string[] | undefined, placeme
   );
 }
 
-function setPlainWidget(key: string, lines: string[] | undefined, placement: "aboveEditor" | "belowEditor", cache: "main" | "reveal"): void {
-  if (!activeCtx?.hasUI) return;
-  const signature = lines ? lines.join("\n") : undefined;
-  if (cache === "main") {
-    if (signature === lastWidgetSignature) return;
-    lastWidgetSignature = signature;
-  } else {
-    if (signature === lastRevealSignature) return;
-    lastRevealSignature = signature;
-  }
-  activeCtx.ui.setWidget(key, lines, { placement });
-}
-
 function renderActiveWidget(): void {
   if (!activeCtx?.hasUI || !activeState) return;
   if (activeState.hidden) {
-    setRightAlignedWidget(BUDDY_WIDGET_KEY, undefined, "belowEditor", "main");
-    setPlainWidget(BUDDY_REVEAL_WIDGET_KEY, undefined, "aboveEditor", "reveal");
+    setRightAlignedWidget(BUDDY_WIDGET_KEY, undefined, "belowEditor");
+    activeCtx.ui.setWidget(BUDDY_REVEAL_WIDGET_KEY, undefined, { placement: "aboveEditor" });
     activeCtx.ui.setStatus(BUDDY_STATUS_KEY, undefined);
     return;
   }
   const companion = getCompanion(activeState);
   if (!companion) {
-    setPlainWidget(BUDDY_REVEAL_WIDGET_KEY, undefined, "aboveEditor", "reveal");
-    setRightAlignedWidget(BUDDY_WIDGET_KEY, isBuddyTeaserWindow() ? teaserLines() : undefined, "belowEditor", "main");
+    activeCtx.ui.setWidget(BUDDY_REVEAL_WIDGET_KEY, undefined, { placement: "aboveEditor" });
+    setRightAlignedWidget(BUDDY_WIDGET_KEY, isBuddyTeaserWindow() ? teaserLines() : undefined, "belowEditor");
     activeCtx.ui.setStatus(BUDDY_STATUS_KEY, undefined);
     return;
   }
-  const showingReveal = revealVisible;
-  setPlainWidget(BUDDY_REVEAL_WIDGET_KEY, showingReveal ? hatchCardLines(companion) : undefined, "aboveEditor", "reveal");
-  setRightAlignedWidget(BUDDY_WIDGET_KEY, widgetLines(activeState, companion), "belowEditor", "main");
+  activeCtx.ui.setWidget(BUDDY_REVEAL_WIDGET_KEY, undefined, { placement: "aboveEditor" });
+  setRightAlignedWidget(BUDDY_WIDGET_KEY, widgetLines(activeState, companion), "belowEditor");
   activeCtx.ui.setStatus(BUDDY_STATUS_KEY, undefined);
 }
 
@@ -557,10 +537,16 @@ async function hatchBuddy(ctx: ExtensionContext, state: BuddyState): Promise<Com
   state.muted = false;
   state.lastPetAt = undefined;
   saveState(state);
-  revealVisible = true;
   setReaction(undefined);
+  const companion = getCompanion(state)!;
+  piRef?.sendMessage({
+    customType: "buddy-reveal",
+    content: `${companion.name} hatched`,
+    display: true,
+    details: { companion },
+  });
   renderActiveWidget();
-  return getCompanion(state)!;
+  return companion;
 }
 
 function rerollBuddy(state: BuddyState): void {
@@ -575,12 +561,30 @@ function rerollBuddy(state: BuddyState): void {
 export default function buddyExtension(pi: ExtensionAPI): void {
   const state = loadState();
   activeState = state;
+  piRef = pi;
+
+  pi.registerMessageRenderer("buddy-reveal", (message) => {
+    const details = message.details as { companion?: Companion } | undefined;
+    const companion = details?.companion;
+    if (!companion) return new Text(message.content, 0, 0);
+    const stats = STAT_NAMES.map((stat) => `${padRight(stat, 11)} ${String(companion.stats[stat]).padStart(3)}`);
+    const lines = [
+      `${rarityLabel(companion.rarity)} ${companion.rarity.toUpperCase()}   ${companion.species.toUpperCase()}`,
+      "",
+      ...renderSprite(companion, 0),
+      "",
+      companion.name,
+      companion.personality,
+      "",
+      ...stats,
+    ];
+    return new Text(lines.join("\n"), 0, 0);
+  });
 
   pi.on("session_start", async (_event, ctx) => {
     activeCtx = ctx;
     activeState = state;
     lastWidgetSignature = undefined;
-    lastRevealSignature = undefined;
     ensureTicker();
     renderActiveWidget();
     const companion = getCompanion(state);
@@ -647,7 +651,6 @@ export default function buddyExtension(pi: ExtensionAPI): void {
         state.muted = false;
         saveState(state);
         setReaction(`${companion.name} is back.`);
-        revealVisible = false;
         renderActiveWidget();
         return;
       }
@@ -660,7 +663,6 @@ export default function buddyExtension(pi: ExtensionAPI): void {
         state.hidden = false;
         state.lastPetAt = Date.now();
         saveState(state);
-        revealVisible = false;
         setReaction(`${companion.name} leans into the petting.`);
         renderActiveWidget();
         return;
@@ -679,7 +681,6 @@ export default function buddyExtension(pi: ExtensionAPI): void {
         }
         state.companion = { ...state.companion!, name: remainder };
         saveState(state);
-        revealVisible = false;
         setReaction(`${remainder} renamed.`);
         renderActiveWidget();
         return;
@@ -692,7 +693,6 @@ export default function buddyExtension(pi: ExtensionAPI): void {
         }
         state.companion = { ...state.companion!, personality: remainder };
         saveState(state);
-        revealVisible = false;
         setReaction("new vibe installed.");
         renderActiveWidget();
         return;
@@ -704,7 +704,6 @@ export default function buddyExtension(pi: ExtensionAPI): void {
         state.muted = false;
         state.lastPetAt = undefined;
         saveState(state);
-        revealVisible = false;
         setReaction(undefined);
         renderActiveWidget();
         ctx.ui.notify("Buddy reset. Run /buddy to hatch again.", "info");
@@ -718,7 +717,6 @@ export default function buddyExtension(pi: ExtensionAPI): void {
 
       state.hidden = false;
       saveState(state);
-      revealVisible = false;
       renderActiveWidget();
     },
   });
