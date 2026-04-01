@@ -1,0 +1,9 @@
+{
+  "name": "pi-buddy",
+  "private": false,
+  "type": "module",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}
